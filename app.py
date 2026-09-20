@@ -19,24 +19,27 @@ st.set_page_config(page_title="Educational Institution Management System", page_
 # WAL lets readers continue while another connection is writing.
 _DB_LOCAL = threading.local()
 
+@st.cache_resource
+def get_turso():
+    try:
+        import libsql
+        url = st.secrets["TURSO_DATABASE_URL"]
+        token = st.secrets["TURSO_AUTH_TOKEN"]
+        return libsql.connect(database=url, auth_token=token)
+    except:
+        return None
+
 def db():
-    url = os.getenv("TURSO_DATABASE_URL")
-    token = os.getenv("TURSO_AUTH_TOKEN")
-    if url and token:
-        try:
-            import libsql
-            return libsql.connect(database=url, auth_token=token)
-        except:
-            pass
+    # FAST - uses cached connection
+    c = get_turso()
+    if c is not None:
+        return c
+    # fallback for local
     conn = getattr(_DB_LOCAL, "conn", None)
     if conn is None:
         conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
-        conn.execute("PRAGMA synchronous = NORMAL")
-        conn.execute("PRAGMA busy_timeout = 30000")
-        conn.execute("PRAGMA temp_store = MEMORY")
-        conn.execute("PRAGMA cache_size = -32000")
         _DB_LOCAL.conn = conn
     return conn
 
