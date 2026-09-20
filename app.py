@@ -251,7 +251,7 @@ def initialize():
         x.execute("""INSERT INTO users(username,password,name,role,school_id,active,
                     can_change_username,can_change_password,created_at)
                     VALUES(?,?,?,?,NULL,1,1,1,?)""",
-                  ("admin", hash_password("Admin@123"), "System Administrator", "admin", now()))
+                  ("admin", hash_password("Mama@1234"), "System Administrator", "admin", now()))
     # Preserve legacy marks by copying them into the current academic-year history table.
     current_year = str(date.today().year)
     legacy_marks = x.execute("""SELECT m.student_id,m.subject_id,s.class_id,m.marks,m.updated_at
@@ -1265,7 +1265,6 @@ if not st.session_state.logged_in:
                 st.error("School is suspended or subscription has expired.")
             else:
                 st.session_state.logged_in = True; st.session_state.user = a1; st.rerun()
-        st.info("First login: admin / Admin@123 — change it from Admin Security.")
     st.divider();
     st.header("🎓 Public Result Portal")
     st.caption("School Code + Class + Section + Roll Number are required, so identical roll numbers cannot mismatch.")
