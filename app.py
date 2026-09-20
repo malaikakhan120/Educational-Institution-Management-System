@@ -1,3 +1,7 @@
+import os
+from dotenv import load_dotenv
+load_dotenv()
+
 import streamlit as st
 import sqlite3, hashlib, secrets, io, threading, time, os
 from datetime import date, datetime, timedelta
@@ -16,6 +20,14 @@ st.set_page_config(page_title="Educational Institution Management System", page_
 _DB_LOCAL = threading.local()
 
 def db():
+    url = os.getenv("TURSO_DATABASE_URL")
+    token = os.getenv("TURSO_AUTH_TOKEN")
+    if url and token:
+        try:
+            import libsql
+            return libsql.connect(database=url, auth_token=token)
+        except:
+            pass
     conn = getattr(_DB_LOCAL, "conn", None)
     if conn is None:
         conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
