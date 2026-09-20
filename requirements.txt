@@ -1,4 +1,4 @@
 streamlit
 pandas
-libsql-experimental
+libsql
 python-dotenv
