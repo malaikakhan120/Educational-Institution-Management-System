@@ -15,64 +15,139 @@ st.set_page_config(page_title="Educational Institution Management System", page_
 
 # ---------------- DATABASE ----------------
 
-# Per-thread SQLite connections avoid reconnecting for every SELECT/UPDATE.
-# WAL lets readers continue while another connection is writing.
+# The deployed application must use Turso. Local SQLite is available only when
+# explicitly enabled with ALLOW_LOCAL_SQLITE=1 for local development/testing.
 _DB_LOCAL = threading.local()
 
-@st.cache_resource
-def get_turso():
+
+def _truthy(value):
+    return str(value or "").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _turso_configured():
+    return bool(os.getenv("TURSO_DATABASE_URL") and os.getenv("TURSO_AUTH_TOKEN"))
+
+
+def _new_turso_connection():
+    url = os.getenv("TURSO_DATABASE_URL")
+    token = os.getenv("TURSO_AUTH_TOKEN")
+    if not url or not token:
+        raise RuntimeError(
+            "Turso is not configured. Set TURSO_DATABASE_URL and "
+            "TURSO_AUTH_TOKEN in the deployed application's secrets/environment."
+        )
     try:
         import libsql
-        url = st.secrets["TURSO_DATABASE_URL"]
-        token = st.secrets["TURSO_AUTH_TOKEN"]
-        return libsql.connect(database=url, auth_token=token)
-    except:
-        return None
+    except Exception as e:
+        raise RuntimeError(
+            "The libsql package is not installed. Add the libsql package to requirements.txt."
+        ) from e
+    return libsql.connect(database=url, auth_token=token)
+
 
 def db():
-    # FAST - uses cached connection
-    c = get_turso()
-    if c is not None:
-        return c
-    # fallback for local
-    conn = getattr(_DB_LOCAL, "conn", None)
+    """Return a reused connection instead of opening a remote connection per query."""
+    if _turso_configured():
+        conn = getattr(_DB_LOCAL, "turso_conn", None)
+        if conn is None:
+            conn = _new_turso_connection()
+            _DB_LOCAL.turso_conn = conn
+        return conn
+
+    # Never silently fall back to temporary local storage in production.
+    if not _truthy(os.getenv("ALLOW_LOCAL_SQLITE")):
+        raise RuntimeError(
+            "Turso credentials are missing. Local SQLite fallback is disabled "
+            "to protect production data from being stored on temporary hosting storage."
+        )
+
+    conn = getattr(_DB_LOCAL, "sqlite_conn", None)
     if conn is None:
         conn = sqlite3.connect(DB_FILE, timeout=30, check_same_thread=False)
         conn.execute("PRAGMA foreign_keys = ON")
         conn.execute("PRAGMA journal_mode = WAL")
-        _DB_LOCAL.conn = conn
+        conn.execute("PRAGMA synchronous = NORMAL")
+        conn.execute("PRAGMA busy_timeout = 30000")
+        conn.execute("PRAGMA temp_store = MEMORY")
+        conn.execute("PRAGMA cache_size = -32000")
+        _DB_LOCAL.sqlite_conn = conn
     return conn
 
+
 def execute(q, p=(), fetch=False, many=False):
+    """Execute one SQL statement using the persistent connection.
+
+    Identical SELECTs during the same Streamlit rerun are served from a tiny
+    in-memory cache. Any write clears that cache so a following read is fresh.
+    """
     conn = db()
-    cur = conn.cursor()
-    for attempt in range(4):
+    is_turso = _turso_configured()
+    cache = getattr(_DB_LOCAL, "query_cache", None)
+    if cache is None:
+        cache = {}
+        _DB_LOCAL.query_cache = cache
+
+    if fetch and not many:
         try:
+            cache_key = (q, tuple(p) if isinstance(p, (list, tuple)) else p)
+            if cache_key in cache:
+                return cache[cache_key]
+        except TypeError:
+            cache_key = None
+    else:
+        cache_key = None
+
+    # Turso does not need the old SQLite "database locked" retry loop. Avoiding
+    # those repeated waits is important for responsive remote database queries.
+    attempts = 1 if is_turso else 4
+
+    for attempt in range(attempts):
+        cur = None
+        try:
+            cur = conn.cursor()
             if many:
                 cur.executemany(q, p)
             else:
                 cur.execute(q, p)
+
             result = cur.fetchall() if fetch else None
             if not fetch:
                 conn.commit()
+                cache.clear()
+            elif cache_key is not None:
+                cache[cache_key] = result
             return result
+
         except sqlite3.OperationalError as e:
-            conn.rollback()
-            if "locked" not in str(e).lower() or attempt == 3:
-                st.error(f"Database error: {e}")
-                return None
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            if is_turso or "locked" not in str(e).lower() or attempt == attempts - 1:
+                raise RuntimeError(f"Database error: {e}") from e
             time.sleep(0.08 * (attempt + 1))
-        except sqlite3.Error as e:
-            conn.rollback()
-            st.error(f"Database error: {e}")
-            return None
+
+        except Exception as e:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            raise RuntimeError(f"Database error: {e}") from e
+
         finally:
-            cur.close()
+            if cur is not None:
+                try:
+                    cur.close()
+                except Exception:
+                    pass
+
     return None
+
 
 def one(q, p=()):
     r = execute(q, p, True)
     return r[0] if r else None
+
 
 def now():
     return datetime.now().isoformat(timespec="seconds")
@@ -313,7 +388,20 @@ def initialize():
     # Keep the initialized thread-local connection alive for the app session.
 
 
-initialize()
+# Streamlit reruns this script whenever a widget changes. Cache schema/migration
+# initialization so it happens once per running application process, not on every click.
+@st.cache_resource(show_spinner=False)
+def initialize_database_once():
+    initialize()
+    return True
+
+
+initialize_database_once()
+
+# Each Streamlit rerun gets a fresh small read cache. This avoids requesting the
+# exact same SELECT repeatedly during one page render while never keeping stale
+# data between reruns. Writes clear the cache immediately.
+_DB_LOCAL.query_cache = {}
 
 
 # ---------------- SCHOOL / RESULT HELPERS ----------------
@@ -567,6 +655,50 @@ def attendance_display(student_id):
     return "Attendance Not Added" if total == 0 else f"{pct:.2f}% ({present}/{total})"
 
 
+def attendance_status_map(student_ids, attendance_date):
+    """Load one day's attendance for many students with one SQL query."""
+    if not student_ids:
+        return {}
+    placeholders = ",".join("?" for _ in student_ids)
+    params = [str(attendance_date), *[int(x) for x in student_ids]]
+    rows = execute(
+        f"SELECT student_id,status FROM attendance WHERE attendance_date=? AND student_id IN ({placeholders})",
+        tuple(params), fetch=True
+    ) or []
+    return {int(r[0]): r[1] for r in rows}
+
+
+def attendance_summary_map(student_ids):
+    """Load attendance totals/present counts for many students in one query."""
+    if not student_ids:
+        return {}
+    placeholders = ",".join("?" for _ in student_ids)
+    rows = execute(
+        f"""SELECT student_id,status,COUNT(*)
+            FROM attendance
+            WHERE student_id IN ({placeholders})
+            GROUP BY student_id,status""",
+        tuple(int(x) for x in student_ids), fetch=True
+    ) or []
+    totals = {}
+    for student_id, status, count in rows:
+        sid_int = int(student_id)
+        total, present = totals.get(sid_int, (0, 0))
+        total += int(count)
+        if status == "Present":
+            present += int(count)
+        totals[sid_int] = (total, present)
+    return {
+        sid_int: (total, present, (present / total * 100 if total else None))
+        for sid_int, (total, present) in totals.items()
+    }
+
+
+def attendance_display_from_map(student_id, summary_map):
+    total, present, pct = summary_map.get(int(student_id), (0, 0, None))
+    return "Attendance Not Added" if total == 0 else f"{pct:.2f}% ({present}/{total})"
+
+
 def detailed_results_csv(sid, cid, academic_year=None):
     """Create a class report with batched SQL instead of one query per student/subject."""
     academic_year = academic_year or current_academic_year()
@@ -612,6 +744,8 @@ def detailed_results_csv(sid, cid, academic_year=None):
     posmap={int(r["Student ID"]):int(r["Position"])
             for _,r in posdf.iterrows()} if not posdf.empty else {}
 
+    attendance_map = attendance_summary_map([s[0] for s in students])
+
     data=[]
     for s in students:
         row={"Institution":school[0],"Institution Type":school[1],
@@ -635,7 +769,7 @@ def detailed_results_csv(sid, cid, academic_year=None):
         row["Grade"]=grade(pct)
         row["Result"]="PENDING" if pending else ("PASS" if passed else "FAIL")
         row["Position"]=posmap.get(int(s[0]),"")
-        row["Attendance"]=attendance_display(s[0])
+        row["Attendance"]=attendance_display_from_map(s[0], attendance_map)
         data.append(row)
 
     df=pd.DataFrame(data)
@@ -1111,25 +1245,55 @@ def generate_class_fee_schedule(
     if not students or not cycles:
         return 0, 0, len(students), len(cycles)
 
+    student_ids = [int(r[0]) for r in students]
+    keys = [c[0] for c in cycles]
+    placeholders_students = ",".join("?" for _ in student_ids)
+    placeholders_keys = ",".join("?" for _ in keys)
+
+    existing_rows = execute(
+        f"SELECT student_id,fee_month FROM fee_records "
+        f"WHERE student_id IN ({placeholders_students}) "
+        f"AND fee_month IN ({placeholders_keys})",
+        tuple(student_ids + keys), fetch=True
+    ) or []
+    existing_pairs = {(int(r[0]), str(r[1])) for r in existing_rows}
+
+    rows_to_insert = []
+    audit_rows = []
     created = 0
     existing = 0
+    timestamp = now()
 
-    # Keep each student's history separate. INSERT only missing cycles.
-    for student_row in students:
-        student_id = int(student_row[0])
+    for student_id in student_ids:
         for key, label, due, year, cycle in cycles:
-            found = one(
-                "SELECT id FROM fee_records WHERE student_id=? AND fee_month=?",
-                (student_id, key)
-            )
-            if found:
+            if (student_id, str(key)) in existing_pairs:
                 existing += 1
                 continue
-            save_fee_record(
-                sid, student_id, fee_type, label, key, due,
-                amount, discount, late_fee, notes, actor_id, cycle
-            )
+            rows_to_insert.append((
+                sid, student_id, key, fee_type, label, None, None,
+                year, cycle, str(due), float(amount), float(discount),
+                float(late_fee), notes, timestamp, timestamp
+            ))
+            audit_rows.append((
+                actor_id, "CREATE_FEE_RECORD",
+                f"student={student_id},fee={key},type={fee_type},"
+                f"year={year},cycle={cycle},amount={amount}", timestamp
+            ))
             created += 1
+
+    if rows_to_insert:
+        execute(
+            """INSERT OR IGNORE INTO fee_records
+               (school_id,student_id,fee_month,fee_type,period_label,period_start,
+                period_end,academic_year,cycle_number,due_date,amount_due,discount,
+                late_fee,notes,created_at,updated_at)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            rows_to_insert, many=True
+        )
+        execute(
+            "INSERT INTO audit_logs(user_id,action,details,created_at) VALUES(?,?,?,?)",
+            audit_rows, many=True
+        )
 
     return created, existing, len(students), len(cycles)
 
@@ -1768,8 +1932,13 @@ elif user["role"] in ("principal", "teacher", "management"):
             sub=so[st.selectbox("Subject",list(so),key="result_subject")]
             if sub[3] is None: st.error("Set this subject's passing marks before entering final results.")
             sts=execute("SELECT id,name,roll_number FROM students WHERE school_id=? AND class_id=? AND active=1 ORDER BY roll_number",(sid,cid),True) or []
+            old_rows=execute(
+                "SELECT id,student_id,marks FROM result_marks WHERE subject_id=? AND academic_year=? AND class_id=?",
+                (sub[0],academic_year,cid), fetch=True
+            ) or []
+            old_map={int(r[1]):(r[0],r[2]) for r in old_rows}
             for s in sts:
-                old=one("SELECT marks FROM result_marks WHERE student_id=? AND subject_id=? AND academic_year=?",(s[0],sub[0],academic_year))
+                old=old_map.get(int(s[0]))
                 val=st.number_input(f"{s[1]} (Roll {s[2]})",0.0,float(sub[2]),float(old[0]) if old else 0.0,key=f"mk{s[0]}_{sub[0]}_{academic_year}")
                 if st.button(f"Save {s[1]}",key=f"save{s[0]}_{sub[0]}_{academic_year}"):
                     if old:
@@ -1786,14 +1955,14 @@ elif user["role"] in ("principal", "teacher", "management"):
                     st.success("Saved.")
             st.divider()
             st.subheader("Class Results")
-            result=[]
             posdf=class_positions(sid,cid,academic_year)
-            posmap={int(r["Student ID"]):int(r["Position"]) for _,r in posdf.iterrows()} if not posdf.empty else {}
-            for s in sts:
-                r=student_result(s[0],academic_year,cid)
-                result.append({"Roll":s[2],"Student":s[1],"Total":round(r[2],2),"Percentage":round(r[3],2),
-                                "Grade":r[4],"Result":r[5],"Position":posmap.get(s[0],"")})
-            rdf=pd.DataFrame(result)
+            if posdf.empty:
+                rdf=pd.DataFrame(columns=["Roll","Student","Total","Percentage","Grade","Result","Position"])
+            else:
+                rdf=posdf.rename(columns={
+                    "Roll No":"Roll",
+                    "Student ID":"Student ID"
+                })[["Roll","Student","Total","Percentage","Grade","Result","Position"]].copy()
             st.dataframe(rdf,use_container_width=True,hide_index=True)
             st.subheader("🏆 Top 3 Positions — This Class / Section")
             top=top_three_positions_text(sid,cid,academic_year)
@@ -1863,13 +2032,14 @@ elif user["role"] in ("principal", "teacher", "management"):
             sts = execute(
                 "SELECT id,name,roll_number FROM students WHERE school_id=? AND class_id=? AND active=1 ORDER BY roll_number",
                 (sid, cid), True) or []
+            old_map = attendance_status_map([s[0] for s in sts], ad)
             for s in sts:
-                old = one("SELECT status FROM attendance WHERE student_id=? AND attendance_date=?", (s[0], str(ad)));
+                old_status = old_map.get(int(s[0]))
                 status = st.selectbox(f"{s[1]} (Roll {s[2]})", ["Present", "Absent", "Late", "Leave"],
-                                      index=["Present", "Absent", "Late", "Leave"].index(old[0]) if old else 0,
+                                      index=["Present", "Absent", "Late", "Leave"].index(old_status) if old_status else 0,
                                       key=f"att{s[0]}")
                 if st.button(f"Save {s[1]}", key=f"attb{s[0]}"):
-                    if old:
+                    if old_status:
                         execute("UPDATE attendance SET status=?,recorded_by=? WHERE student_id=? AND attendance_date=?",
                                 (status, user["id"], s[0], str(ad)))
                     else:
@@ -1899,15 +2069,20 @@ elif user["role"] in ("principal", "teacher", "management"):
             ad=st.date_input("Attendance Date",date.today(),key="sa_date")
             sts=execute("SELECT id,name,roll_number FROM students WHERE school_id=? AND class_id=? AND active=1 ORDER BY roll_number",
                         (sid,cid),fetch=True) or []
+            placeholders=",".join("?" for _ in sts) or "NULL"
+            subject_old_rows=execute(
+                f"SELECT student_id,status FROM subject_attendance WHERE subject_id=? AND attendance_date=? AND student_id IN ({placeholders})",
+                tuple([subid,str(ad)] + [int(s[0]) for s in sts]), fetch=True
+            ) if sts else []
+            subject_old_map={int(r[0]):r[1] for r in (subject_old_rows or [])}
             for s in sts:
-                old=one("""SELECT status FROM subject_attendance WHERE student_id=? AND subject_id=? AND attendance_date=?""",
-                        (s[0],subid,str(ad)))
+                old_status=subject_old_map.get(int(s[0]))
                 opts=["Present","Absent","Late","Leave"]
-                status=st.selectbox(f"{s[1]} (Roll {s[2]})",opts,index=opts.index(old[0]) if old else 0,
+                status=st.selectbox(f"{s[1]} (Roll {s[2]})",opts,index=opts.index(old_status) if old_status else 0,
                                     key=f"sa_{s[0]}_{subid}")
                 remarks=st.text_input(f"Remarks - {s[1]}",key=f"sar_{s[0]}_{subid}")
                 if st.button(f"Save {s[1]}",key=f"sab_{s[0]}_{subid}"):
-                    if old:
+                    if old_status:
                         execute("""UPDATE subject_attendance SET status=?,remarks=?,recorded_by=?
                                   WHERE student_id=? AND subject_id=? AND attendance_date=?""",
                                 (status,remarks,user["id"],s[0],subid,str(ad)))
@@ -1936,13 +2111,19 @@ elif user["role"] in ("principal", "teacher", "management"):
         teachers=execute("SELECT id,name,username FROM users WHERE school_id=? AND role='teacher' AND active=1 ORDER BY name",
                          (sid,),fetch=True) or []
         ad=st.date_input("Attendance Date",date.today(),key="ta_date")
+        teacher_placeholders=",".join("?" for _ in teachers) or "NULL"
+        teacher_old_rows=execute(
+            f"SELECT teacher_id,status FROM teacher_attendance WHERE attendance_date=? AND teacher_id IN ({teacher_placeholders})",
+            tuple([str(ad)] + [int(t[0]) for t in teachers]), fetch=True
+        ) if teachers else []
+        teacher_old_map={int(r[0]):r[1] for r in (teacher_old_rows or [])}
         for t in teachers:
-            old=one("SELECT status FROM teacher_attendance WHERE teacher_id=? AND attendance_date=?",(t[0],str(ad)))
+            old_status=teacher_old_map.get(int(t[0]))
             opts=["Present","Absent","Late","Leave"]
-            status=st.selectbox(f"{t[1]} ({t[2]})",opts,index=opts.index(old[0]) if old else 0,key=f"ta_{t[0]}")
+            status=st.selectbox(f"{t[1]} ({t[2]})",opts,index=opts.index(old_status) if old_status else 0,key=f"ta_{t[0]}")
             remarks=st.text_input(f"Remarks - {t[1]}",key=f"tar_{t[0]}")
             if st.button(f"Save {t[1]}",key=f"tab_{t[0]}"):
-                if old:
+                if old_status:
                     execute("""UPDATE teacher_attendance SET status=?,remarks=?,recorded_by=?
                                WHERE teacher_id=? AND attendance_date=?""",
                             (status,remarks,user["id"],t[0],str(ad)))
@@ -2966,4 +3147,4 @@ elif user["role"] in ("student", "parent"):
                             log(user["id"],"CHANGE_PASSWORD"); st.success("Password changed.")
 
 st.divider();
-st.caption("🎓 Multi-Institution Educational Management Platform • Performance-optimized SQLite mode")
+st.caption("🎓 Multi-Institution Educational Management Platform • Secure Turso Database Mode")
