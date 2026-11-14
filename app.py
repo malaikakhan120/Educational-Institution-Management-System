@@ -13,11 +13,35 @@ MAX_SCHOOLS = None  # None = no application-level school limit. Set an integer o
 st.set_page_config(page_title="Educational Institution Management System", page_icon="🎓", layout="wide")
 
 
+# ---------------- PERFORMANCE SETTINGS ----------------
+# NOTE: Streamlit re-executes this whole script on every click, in a FRESH module
+# namespace. Anything stored in a plain global / threading.local() is therefore lost
+# on every rerun (this used to force a brand-new Turso connection on almost every
+# click). Everything that must survive reruns lives in st.cache_resource below.
+_QUERY_CACHE_TTL = 60          # seconds; safety net only (every write clears the cache immediately)
+_QUERY_CACHE_MAX = 3000        # max cached SELECT results held in memory
+_RESULT_TTL = 120              # seconds for cached pandas/report computations
+_POOL_MAX = 6                  # idle Turso connections kept alive between reruns
+SCHEMA_VERSION = "2025-opt-1"  # bump this string if you ever add new tables/columns/migrations
+
+
 # ---------------- DATABASE ----------------
 
 # The deployed application must use Turso. Local SQLite is available only when
 # explicitly enabled with ALLOW_LOCAL_SQLITE=1 for local development/testing.
 _DB_LOCAL = threading.local()
+
+
+@st.cache_resource(show_spinner=False)
+def _shared_state():
+    """Process-wide state shared by every session and every rerun."""
+    return {
+        "lock": threading.RLock(),
+        "cache": {},       # (sql, params) -> (timestamp, rows)
+        "version": 0,      # bumped on every write; used to invalidate cached reports
+        "pool": [],        # idle Turso connections that are reused between reruns
+        "pool_ok": True,   # becomes False only if the driver refuses cross-thread use
+    }
 
 
 def _truthy(value):
@@ -42,7 +66,10 @@ def _new_turso_connection():
         raise RuntimeError(
             "The libsql package is not installed. Add the libsql package to requirements.txt."
         ) from e
-    return libsql.connect(database=url, auth_token=token)
+    try:
+        return libsql.connect(database=url, auth_token=token, check_same_thread=False)
+    except TypeError:
+        return libsql.connect(database=url, auth_token=token)
 
 
 def db():
@@ -74,78 +101,170 @@ def db():
     return conn
 
 
-def execute(q, p=(), fetch=False, many=False):
-    """Execute one SQL statement using the persistent connection.
+# ---- Turso connection pool (connections survive Streamlit reruns) ----
+def _borrow_turso():
+    state = _STATE
+    with state["lock"]:
+        if state["pool"]:
+            return state["pool"].pop()
+    return _new_turso_connection()
 
-    Identical SELECTs during the same Streamlit rerun are served from a tiny
-    in-memory cache. Any write clears that cache so a following read is fresh.
-    """
-    conn = db()
-    is_turso = _turso_configured()
-    cache = getattr(_DB_LOCAL, "query_cache", None)
-    if cache is None:
-        cache = {}
-        _DB_LOCAL.query_cache = cache
 
-    if fetch and not many:
+def _return_turso(conn):
+    state = _STATE
+    with state["lock"]:
+        if len(state["pool"]) < _POOL_MAX:
+            state["pool"].append(conn)
+            return
+    try:
+        conn.close()
+    except Exception:
+        pass
+
+
+def _discard_turso(conn, pooled):
+    if conn is not None:
         try:
-            cache_key = (q, tuple(p) if isinstance(p, (list, tuple)) else p)
-            if cache_key in cache:
-                return cache[cache_key]
-        except TypeError:
-            cache_key = None
-    else:
-        cache_key = None
-
-    # Turso does not need the old SQLite "database locked" retry loop. Avoiding
-    # those repeated waits is important for responsive remote database queries.
-    attempts = 1 if is_turso else 4
-
-    for attempt in range(attempts):
-        cur = None
+            conn.rollback()
+        except Exception:
+            pass
         try:
-            cur = conn.cursor()
-            if many:
-                cur.executemany(q, p)
-            else:
-                cur.execute(q, p)
+            conn.close()
+        except Exception:
+            pass
+    if not pooled:
+        _DB_LOCAL.turso_conn = None
 
-            result = cur.fetchall() if fetch else None
-            if not fetch:
-                conn.commit()
-                cache.clear()
-            elif cache_key is not None:
-                cache[cache_key] = result
+
+def _is_thread_error(e):
+    msg = str(e).lower()
+    return "thread" in msg or "unsendable" in msg
+
+
+def _run_statement(conn, q, p, fetch, many):
+    cur = None
+    try:
+        cur = conn.cursor()
+        if many:
+            cur.executemany(q, p)
+        else:
+            cur.execute(q, p)
+        result = cur.fetchall() if fetch else None
+        if not fetch:
+            conn.commit()
+        return result
+    finally:
+        if cur is not None:
+            try:
+                cur.close()
+            except Exception:
+                pass
+
+
+def _execute_turso(q, p, fetch, many):
+    state = _STATE
+    # Reads may be retried once on a fresh connection (stale/expired remote stream).
+    # Writes are never retried automatically so nothing can be inserted twice.
+    retry_budget = 1 if (fetch and not many) else 0
+    thread_fallback_used = False
+    while True:
+        pooled = state["pool_ok"]
+        conn = None
+        try:
+            conn = _borrow_turso() if pooled else db()
+            result = _run_statement(conn, q, p, fetch, many)
+            if pooled:
+                _return_turso(conn)
             return result
+        except Exception as e:
+            _discard_turso(conn, pooled)
+            if pooled and _is_thread_error(e) and not thread_fallback_used:
+                # Driver is thread-affine: fall back to per-thread connections.
+                state["pool_ok"] = False
+                thread_fallback_used = True
+                continue
+            if retry_budget > 0:
+                retry_budget -= 1
+                continue
+            raise RuntimeError(f"Database error: {e}") from e
 
+
+def _execute_sqlite(q, p, fetch, many):
+    conn = db()
+    attempts = 4
+    for attempt in range(attempts):
+        try:
+            return _run_statement(conn, q, p, fetch, many)
         except sqlite3.OperationalError as e:
             try:
                 conn.rollback()
             except Exception:
                 pass
-            if is_turso or "locked" not in str(e).lower() or attempt == attempts - 1:
+            if "locked" not in str(e).lower() or attempt == attempts - 1:
                 raise RuntimeError(f"Database error: {e}") from e
             time.sleep(0.08 * (attempt + 1))
-
         except Exception as e:
             try:
                 conn.rollback()
             except Exception:
                 pass
             raise RuntimeError(f"Database error: {e}") from e
-
-        finally:
-            if cur is not None:
-                try:
-                    cur.close()
-                except Exception:
-                    pass
-
     return None
 
 
-def one(q, p=()):
-    r = execute(q, p, True)
+def _invalidate_caches():
+    state = _STATE
+    with state["lock"]:
+        state["cache"].clear()
+        state["version"] += 1
+
+
+def execute(q, p=(), fetch=False, many=False, fresh=False):
+    """Execute one SQL statement using pooled, persistent connections.
+
+    Identical SELECTs are served from a process-wide in-memory cache shared by all
+    sessions/reruns. ANY write clears that cache immediately, so the next read is
+    always fresh. fresh=True bypasses the cache (used for login checks).
+    """
+    state = _STATE
+    is_turso = _turso_configured()
+    cache_key = None
+    version_at_start = None
+
+    if fetch and not many and not fresh:
+        try:
+            cache_key = (q, tuple(p) if isinstance(p, (list, tuple)) else p)
+            hash(cache_key)
+        except TypeError:
+            cache_key = None
+        if cache_key is not None:
+            with state["lock"]:
+                version_at_start = state["version"]
+                hit = state["cache"].get(cache_key)
+                if hit is not None and (time.time() - hit[0]) <= _QUERY_CACHE_TTL:
+                    return list(hit[1])
+
+    try:
+        if is_turso:
+            result = _execute_turso(q, p, fetch, many)
+        else:
+            result = _execute_sqlite(q, p, fetch, many)
+    finally:
+        if not fetch:
+            _invalidate_caches()
+
+    if cache_key is not None and result is not None:
+        with state["lock"]:
+            # Only store if no write happened while this query was running.
+            if state["version"] == version_at_start:
+                if len(state["cache"]) >= _QUERY_CACHE_MAX:
+                    state["cache"].clear()
+                state["cache"][cache_key] = (time.time(), list(result))
+    return result
+
+
+def one(q, p=(), fresh=False):
+    r = execute(q, p, True, fresh=fresh)
     return r[0] if r else None
 
 
@@ -343,14 +462,13 @@ def initialize():
                     VALUES(?,?,?,?,NULL,1,1,1,?)""",
                   ("admin", hash_password("Mama@1234"), "System Administrator", "admin", now()))
     # Preserve legacy marks by copying them into the current academic-year history table.
+    # One set-based statement instead of one INSERT round-trip per legacy mark.
     current_year = str(date.today().year)
-    legacy_marks = x.execute("""SELECT m.student_id,m.subject_id,s.class_id,m.marks,m.updated_at
-                                FROM marks m JOIN students s ON s.id=m.student_id""").fetchall()
-    for stid,subid,cid,mk,updated in legacy_marks:
-        x.execute("""INSERT OR IGNORE INTO result_marks
-                    (student_id,subject_id,class_id,academic_year,marks,updated_at)
-                    VALUES(?,?,?,?,?,?)""",
-                  (stid,subid,cid,current_year,float(mk),updated or now()))
+    x.execute("""INSERT OR IGNORE INTO result_marks
+                (student_id,subject_id,class_id,academic_year,marks,updated_at)
+                SELECT m.student_id,m.subject_id,s.class_id,?,m.marks,COALESCE(NULLIF(m.updated_at,''),?)
+                FROM marks m JOIN students s ON s.id=m.student_id""",
+              (current_year, now()))
     # Performance indexes. They are created once and make the most-used
     # school/class/student/fee queries index-backed instead of full-table scans.
     indexes = [
@@ -388,20 +506,42 @@ def initialize():
     # Keep the initialized thread-local connection alive for the app session.
 
 
-# Streamlit reruns this script whenever a widget changes. Cache schema/migration
-# initialization so it happens once per running application process, not on every click.
+# Streamlit reruns this script whenever a widget changes. Schema/migration
+# initialization runs once per application process, and is skipped entirely
+# (one tiny SELECT instead of ~100 round-trips to Turso) when the database is
+# already marked as initialized for this SCHEMA_VERSION.
+_STATE = _shared_state()
+
+
+def _schema_ready():
+    if _truthy(os.getenv("FORCE_DB_INIT")):
+        return False
+    try:
+        r = one("SELECT value FROM platform_settings WHERE key='schema_version'", fresh=True)
+        return bool(r and r[0] == SCHEMA_VERSION)
+    except Exception:
+        return False
+
+
 @st.cache_resource(show_spinner=False)
 def initialize_database_once():
-    initialize()
+    if not _schema_ready():
+        try:
+            initialize()
+        finally:
+            # initialize() used a one-off per-thread connection; release it.
+            leftover = getattr(_DB_LOCAL, "turso_conn", None)
+            if leftover is not None:
+                try:
+                    leftover.close()
+                except Exception:
+                    pass
+                _DB_LOCAL.turso_conn = None
+        execute("INSERT OR REPLACE INTO platform_settings(key,value) VALUES('schema_version',?)", (SCHEMA_VERSION,))
     return True
 
 
 initialize_database_once()
-
-# Each Streamlit rerun gets a fresh small read cache. This avoids requesting the
-# exact same SELECT repeatedly during one page render while never keeping stale
-# data between reruns. Writes clear the cache immediately.
-_DB_LOCAL.query_cache = {}
 
 
 # ---------------- SCHOOL / RESULT HELPERS ----------------
@@ -458,7 +598,7 @@ def activate_account(account_id, actor_id):
 def school_code():
     while True:
         code = secrets.token_hex(3).upper()
-        if not one("SELECT id FROM schools WHERE code=?", (code,)): return code
+        if not one("SELECT id FROM schools WHERE code=?", (code,), fresh=True): return code
 
 
 def grade(p):
@@ -480,8 +620,7 @@ def result_calc(marks, maxs, passes):
     return total, pct, g, "PASS" if all(float(m) >= float(p) for m, p in zip(marks, passes)) else "FAIL"
 
 
-
-def student_result(sid, academic_year=None, class_id=None):
+def _student_result_impl(sid, academic_year=None, class_id=None):
     """Build one result with one SQL query instead of one query per subject."""
     academic_year = academic_year or current_academic_year()
     current = current_academic_year()
@@ -525,7 +664,17 @@ def student_result(sid, academic_year=None, class_id=None):
     return (stu[0],stu[1],stu[2],class_name,section,display_class_id,academic_year), pd.DataFrame(rows), total,pct,g,res
 
 
-def class_positions(sid, cid, academic_year):
+@st.cache_data(show_spinner=False, ttl=_RESULT_TTL, max_entries=1024)
+def _student_result_cached(data_version, sid, academic_year, class_id):
+    return _student_result_impl(sid, academic_year, class_id)
+
+
+def student_result(sid, academic_year=None, class_id=None):
+    """Cached result card. The cache key includes a data version that changes on every write."""
+    return _student_result_cached(_STATE["version"], sid, academic_year or current_academic_year(), class_id)
+
+
+def _class_positions_impl(sid, cid, academic_year):
     """Calculate an entire class in one aggregate query (no N+1 student queries)."""
     current = current_academic_year()
     if academic_year == current:
@@ -589,6 +738,16 @@ def class_positions(sid, cid, academic_year):
     return df.sort_values(["Position","Percentage","Roll No"],
                           ascending=[True,False,True]).reset_index(drop=True)
 
+
+@st.cache_data(show_spinner=False, ttl=_RESULT_TTL, max_entries=1024)
+def _class_positions_cached(data_version, sid, cid, academic_year):
+    return _class_positions_impl(sid, cid, academic_year)
+
+
+def class_positions(sid, cid, academic_year):
+    return _class_positions_cached(_STATE["version"], sid, cid, academic_year)
+
+
 def top_three_positions_text(sid,cid,academic_year):
     df=class_positions(sid,cid,academic_year)
     if df.empty: return []
@@ -599,6 +758,7 @@ def top_three_positions_text(sid,cid,academic_year):
     return out
 
 
+@st.cache_data(show_spinner=False, ttl=_RESULT_TTL, max_entries=128)
 def excel_bytes(df):
     out = io.BytesIO()
     try:
@@ -609,7 +769,7 @@ def excel_bytes(df):
         return None
 
 
-def pdf_bytes(sid):
+def _pdf_bytes_impl(sid):
     from reportlab.lib import colors
     from reportlab.lib.pagesizes import A4
     from reportlab.lib.styles import getSampleStyleSheet
@@ -635,6 +795,16 @@ def pdf_bytes(sid):
               Paragraph(f"Total: {total:g} | Percentage: {pct:.2f}% | Grade: {g} | Result: {res}", styles["Heading3"])]
     doc.build(story);
     return out.getvalue()
+
+
+@st.cache_data(show_spinner=False, ttl=_RESULT_TTL, max_entries=256)
+def _pdf_bytes_cached(data_version, sid, academic_year):
+    return _pdf_bytes_impl(sid)
+
+
+def pdf_bytes(sid):
+    """PDF is generated once per (student, data version) instead of on every rerun."""
+    return _pdf_bytes_cached(_STATE["version"], sid, current_academic_year())
 
 
 
@@ -699,7 +869,7 @@ def attendance_display_from_map(student_id, summary_map):
     return "Attendance Not Added" if total == 0 else f"{pct:.2f}% ({present}/{total})"
 
 
-def detailed_results_csv(sid, cid, academic_year=None):
+def _detailed_results_csv_impl(sid, cid, academic_year=None):
     """Create a class report with batched SQL instead of one query per student/subject."""
     academic_year = academic_year or current_academic_year()
     current = current_academic_year()
@@ -784,6 +954,16 @@ def detailed_results_csv(sid, cid, academic_year=None):
         summary_rows[1][f"{sub[1]} Marks"]="" if sub[3] is None else float(sub[3])
     return pd.concat([df,pd.DataFrame(summary_rows)],ignore_index=True)
 
+
+@st.cache_data(show_spinner=False, ttl=_RESULT_TTL, max_entries=256)
+def _detailed_results_csv_cached(data_version, sid, cid, academic_year):
+    return _detailed_results_csv_impl(sid, cid, academic_year)
+
+
+def detailed_results_csv(sid, cid, academic_year=None):
+    return _detailed_results_csv_cached(_STATE["version"], sid, cid, academic_year or current_academic_year())
+
+
 def attendance_csv_df(sid, cid=None):
     sql="""SELECT s.name,s.roll_number,c.class_name,COALESCE(c.section,''),a.attendance_date,a.status,COALESCE(a.remarks,'')
            FROM attendance a JOIN students s ON s.id=a.student_id
@@ -814,23 +994,99 @@ def subject_attendance_df(sid,cid,subject_id):
 
 
 def institution_statistics(sid):
-    """Return all institution dashboard counts with one grouped query."""
+    """Return all institution dashboard counts with two small queries."""
     rows = execute(
         """SELECT role,COUNT(*) FROM users
            WHERE school_id=? GROUP BY role""", (sid,), fetch=True) or []
     counts={r[0]:int(r[1]) for r in rows}
-    students=one("SELECT COUNT(*) FROM students WHERE school_id=?",(sid,))
-    classes=one("SELECT COUNT(*) FROM classes WHERE school_id=?",(sid,))
+    totals=one("SELECT (SELECT COUNT(*) FROM students WHERE school_id=?),(SELECT COUNT(*) FROM classes WHERE school_id=?)",
+               (sid,sid))
+    students=int(totals[0]) if totals else 0
+    classes=int(totals[1]) if totals else 0
     return (
         counts.get("teacher",0), counts.get("principal",0),
         counts.get("management",0), counts.get("parent",0),
-        int(students[0] if students else 0), int(classes[0] if classes else 0)
+        students, classes
     )
+
+
+def all_institution_statistics():
+    """Statistics for EVERY institution using 3 grouped queries (instead of 3 per school).
+
+    Returns {school_id: (teachers, principals, management, parents, students, classes)}
+    """
+    role_rows = execute(
+        "SELECT school_id,role,COUNT(*) FROM users WHERE school_id IS NOT NULL GROUP BY school_id,role",
+        fetch=True) or []
+    student_rows = execute("SELECT school_id,COUNT(*) FROM students GROUP BY school_id", fetch=True) or []
+    class_rows = execute("SELECT school_id,COUNT(*) FROM classes GROUP BY school_id", fetch=True) or []
+    roles = {}
+    for school_id, role, count in role_rows:
+        roles.setdefault(int(school_id), {})[role] = int(count)
+    students = {int(r[0]): int(r[1]) for r in student_rows}
+    classes = {int(r[0]): int(r[1]) for r in class_rows}
+    out = {}
+    for school_id in set(roles) | set(students) | set(classes):
+        rc = roles.get(school_id, {})
+        out[school_id] = (
+            rc.get("teacher", 0), rc.get("principal", 0), rc.get("management", 0), rc.get("parent", 0),
+            students.get(school_id, 0), classes.get(school_id, 0)
+        )
+    return out
+
+
+def _class_performance_summary_impl(sid):
+    """Average percentage per class for the current year in ONE aggregate query.
+
+    Produces the same numbers as averaging detailed_results_csv() for every class
+    (including its "Students" count, which counts the two summary rows of that report).
+    """
+    current = current_academic_year()
+    classes = execute("SELECT id,class_name,section FROM classes WHERE school_id=?", (sid,), fetch=True) or []
+    rows = execute(
+        """SELECT s.class_id,s.id,
+                  COALESCE(SUM(COALESCE(rm.marks,m.marks,0)),0) AS total,
+                  COALESCE(SUM(sub.max_marks),0) AS possible
+           FROM students s
+           LEFT JOIN subjects sub ON sub.school_id=s.school_id
+           LEFT JOIN result_marks rm
+             ON rm.student_id=s.id AND rm.subject_id=sub.id AND rm.academic_year=?
+           LEFT JOIN marks m
+             ON m.student_id=s.id AND m.subject_id=sub.id
+           WHERE s.school_id=? AND s.active=1
+           GROUP BY s.class_id,s.id""",
+        (current, sid), fetch=True) or []
+    by_class = {}
+    for class_id, _student_id, total, possible in rows:
+        total = float(total or 0)
+        possible = float(possible or 0)
+        pct = round((total / possible * 100) if possible else 0, 2)
+        by_class.setdefault(int(class_id), []).append(pct)
+    out = []
+    for cid, cname, csec in classes:
+        vals = by_class.get(int(cid))
+        if vals:
+            out.append({
+                "Class": cname, "Section": csec,
+                "Average %": round(sum(vals) / len(vals), 2),
+                "Students": len(vals) + 2,
+            })
+    return out
+
+
+@st.cache_data(show_spinner=False, ttl=_RESULT_TTL, max_entries=128)
+def _class_performance_summary_cached(data_version, sid, year):
+    return _class_performance_summary_impl(sid)
+
+
+def class_performance_summary(sid):
+    return _class_performance_summary_cached(_STATE["version"], sid, current_academic_year())
+
 
 def create_user(username, password, name, role, school_id=None, student_id=None, permissions=None):
     permissions = permissions or {}
     username = username.strip()
-    if one("SELECT id FROM users WHERE username=?", (username,)):
+    if one("SELECT id FROM users WHERE username=?", (username,), fresh=True):
         return False, "Username already exists."
     execute("""INSERT INTO users(
         username,password,name,role,school_id,student_id,active,can_view_fees,
@@ -977,7 +1233,7 @@ def fee_period_sort_key(fee_type, fee_key):
     return 0
 
 
-def fee_records_df(
+def _fee_records_df_impl(
     sid,
     class_id=None,
     student_id=None,
@@ -1083,6 +1339,31 @@ def fee_records_df(
     return df
 
 
+@st.cache_data(show_spinner=False, ttl=_RESULT_TTL, max_entries=512)
+def _fee_records_df_cached(data_version, today_key, sid, class_id, student_id,
+                           fee_type, academic_year, fee_key, only_outstanding):
+    return _fee_records_df_impl(
+        sid, class_id=class_id, student_id=student_id, fee_type=fee_type,
+        academic_year=academic_year, fee_key=fee_key, only_outstanding=only_outstanding
+    )
+
+
+def fee_records_df(
+    sid,
+    class_id=None,
+    student_id=None,
+    fee_type=None,
+    academic_year=None,
+    fee_key=None,
+    only_outstanding=False,
+):
+    """Cached fee table; the key includes the data version and today's date (overdue status)."""
+    return _fee_records_df_cached(
+        _STATE["version"], str(date.today()), sid, class_id, student_id,
+        fee_type, academic_year, fee_key, bool(only_outstanding)
+    )
+
+
 def fee_summary_for_student(student_id):
     school_row = one("SELECT school_id FROM students WHERE id=?", (student_id,))
     if not school_row:
@@ -1143,7 +1424,7 @@ def save_fee_record(
 
     existing = one(
         "SELECT id FROM fee_records WHERE student_id=? AND fee_month=?",
-        (student_id, fee_key)
+        (student_id, fee_key), fresh=True
     )
 
     if existing:
@@ -1175,7 +1456,7 @@ def save_fee_record(
         )
         fid = one(
             "SELECT id FROM fee_records WHERE student_id=? AND fee_month=?",
-            (student_id, fee_key)
+            (student_id, fee_key), fresh=True
         )[0]
         action = "CREATE_FEE_RECORD"
 
@@ -1312,7 +1593,7 @@ def ensure_next_fee_cycle(student_id):
            FROM fee_records
            WHERE student_id=? AND COALESCE(fee_type,'Monthly') IN ('Monthly','Semester','Yearly')
            ORDER BY id DESC LIMIT 1""",
-        (int(student_id),)
+        (int(student_id),), fresh=True
     )
     if not latest:
         return False
@@ -1359,7 +1640,7 @@ def ensure_next_fee_cycle(student_id):
 
     if one(
         "SELECT id FROM fee_records WHERE student_id=? AND fee_month=?",
-        (int(student_id), next_key)
+        (int(student_id), next_key), fresh=True
     ):
         return False
 
@@ -1409,13 +1690,14 @@ def fee_payment_total(fee_id):
 
 # ---------------- AUTH ----------------
 def authenticate(u, p):
+    # fresh=True: login must always read the latest account/password/active state.
     x = one(
         """SELECT id,username,password,name,role,school_id,student_id,active,can_view_fees,
                   can_change_username,can_change_password,can_manage_fees,can_manage_attendance,
                   can_manage_results,can_manage_students,can_manage_classes,can_manage_accounts,
                   can_view_dashboard
            FROM users WHERE username=?""",
-        (u.strip(),))
+        (u.strip(),), fresh=True)
     if not x or x[7] != 1 or not verify_password(p, x[2]): return None
     if x[4] != "admin" and not school_active(x[5]): return "SUSPENDED"
     return {"id": x[0], "username": x[1], "name": x[3], "role": x[4], "school_id": x[5], "student_id": x[6],
@@ -1490,20 +1772,24 @@ if user["role"] == "admin":
     st.title("👑 Super Admin Control Panel")
     schools = execute("SELECT id,name,code,status,subscription_start,subscription_expiry FROM schools ORDER BY id DESC",
                       fetch=True) or []
+    admin_totals = one("""SELECT (SELECT COUNT(*) FROM users WHERE role='teacher'),
+                                 (SELECT COUNT(*) FROM users WHERE role='principal'),
+                                 (SELECT COUNT(*) FROM students)""")
     m1, m2, m3, m4, m5 = st.columns(5);
     m1.metric("Schools", len(schools));
     m2.metric("Active", sum(s[3] == "ACTIVE" for s in schools));
-    m3.metric("Teachers", one("SELECT COUNT(*) FROM users WHERE role='teacher'")[0]);
-    m4.metric("Principals", one("SELECT COUNT(*) FROM users WHERE role='principal'")[0]);
-    m5.metric("Students", one("SELECT COUNT(*) FROM students")[0])
+    m3.metric("Teachers", admin_totals[0]);
+    m4.metric("Principals", admin_totals[1]);
+    m5.metric("Students", admin_totals[2])
     opt = st.sidebar.radio("Admin Menu", ["Dashboard", "Add Institution", "Manage Institutions", "Manage Accounts",
                                           "Account Permissions", "Security & Account Control", "Audit Logs", "Admin Security"])
     if opt == "Dashboard":
         st.header("📊 Platform Overview")
         if schools:
             overview = []
+            all_stats = all_institution_statistics()
             for s in schools:
-                stats = institution_statistics(s[0])
+                stats = all_stats.get(int(s[0]), (0, 0, 0, 0, 0, 0))
                 overview.append({
                     "Institution": s[1], "Code": s[2], "Status": s[3],
                     "Teachers": stats[0], "Principals": stats[1], "Management": stats[2],
@@ -1517,7 +1803,7 @@ if user["role"] == "admin":
             chosen=labels[st.selectbox("View separate institution details",list(labels))]
             sid2=chosen[0]
             a,b,c,d,e,f=st.columns(6)
-            vals=institution_statistics(sid2)
+            vals=all_stats.get(int(sid2),(0,0,0,0,0,0))
             a.metric("Teachers",vals[0]); b.metric("Principals",vals[1]); c.metric("Management",vals[2])
             d.metric("Parents",vals[3]); e.metric("Students",vals[4]); f.metric("Classes",vals[5])
 
@@ -1531,14 +1817,9 @@ if user["role"] == "admin":
             st.dataframe(pd.DataFrame(classes2,columns=["Class","Section","In-Charge Teacher","Students"]),
                          use_container_width=True,hide_index=True)
 
-            perf=[]
-            for cl in execute("SELECT id,class_name,section FROM classes WHERE school_id=?",(sid2,),fetch=True) or []:
-                dr=detailed_results_csv(sid2,cl[0])
-                if not dr.empty:
-                    perf.append({"Class":cl[1],"Section":cl[2],"Average %":round(float(pd.to_numeric(dr["Percentage"], errors="coerce").mean()),2),
-                                  "Students":len(dr)})
+            perf=class_performance_summary(sid2)
             if perf:
-                pdf=pd.DataFrame(perf).sort_values("Average %",ascending=False)
+                pdf=pd.DataFrame(perf,columns=["Class","Section","Average %","Students"]).sort_values("Average %",ascending=False)
                 st.subheader("Class Performance")
                 st.dataframe(pdf,use_container_width=True,hide_index=True)
                 st.success(f"Best-performing class: {pdf.iloc[0]['Class']} - {pdf.iloc[0]['Section']} ({pdf.iloc[0]['Average %']}%)")
@@ -1627,7 +1908,7 @@ if user["role"] == "admin":
                                        permissions={"can_view_fees":role=="principal"})
                     if ok:
                         if role=="parent" and p_student:
-                            pu=one("SELECT id FROM users WHERE username=?",(un.strip(),))[0]
+                            pu=one("SELECT id FROM users WHERE username=?",(un.strip(),),fresh=True)[0]
                             execute("INSERT OR IGNORE INTO parent_student(parent_user_id,student_id) VALUES(?,?)",(pu,p_student))
                         log(user["id"],"CREATE_ACCOUNT",f"{role}:{un.strip()}")
                         st.success(msg); st.rerun()
@@ -1757,7 +2038,7 @@ if user["role"] == "admin":
         new = st.text_input("New Password", type="password");
         con = st.text_input("Confirm New Password", type="password")
         if st.button("Change Password"):
-            stored = one("SELECT password FROM users WHERE id=?", (user["id"],))[0]
+            stored = one("SELECT password FROM users WHERE id=?", (user["id"],), fresh=True)[0]
             if not verify_password(old, stored):
                 st.error("Current password is incorrect.")
             elif len(new) < 6 or new != con:
@@ -1797,10 +2078,11 @@ elif user["role"] in ("principal", "teacher", "management"):
     choice = st.sidebar.radio("School Menu", menu)
     if choice == "Dashboard":
         st.header("📊 School Dashboard")
-        vals = [one("SELECT COUNT(*) FROM classes WHERE school_id=?", (sid,))[0],
-                one("SELECT COUNT(*) FROM subjects WHERE school_id=?", (sid,))[0],
-                one("SELECT COUNT(*) FROM students WHERE school_id=?", (sid,))[0],
-                one("SELECT COUNT(*) FROM users WHERE school_id=? AND role='teacher'", (sid,))[0]]
+        vals = one("""SELECT (SELECT COUNT(*) FROM classes WHERE school_id=?),
+                             (SELECT COUNT(*) FROM subjects WHERE school_id=?),
+                             (SELECT COUNT(*) FROM students WHERE school_id=?),
+                             (SELECT COUNT(*) FROM users WHERE school_id=? AND role='teacher')""",
+                   (sid, sid, sid, sid))
         a, b, c, d = st.columns(4);
         a.metric("Classes", vals[0]);
         b.metric("Subjects", vals[1]);
@@ -1814,7 +2096,7 @@ elif user["role"] in ("principal", "teacher", "management"):
         if st.button("Add Class"):
             if cn.strip() and not one(
                 "SELECT id FROM classes WHERE school_id=? AND class_name=? AND COALESCE(section,'')=?",
-                (sid, cn.strip(), sec.strip())):
+                (sid, cn.strip(), sec.strip()), fresh=True):
                 execute("INSERT INTO classes(school_id,class_name,section,created_at) VALUES(?,?,?,?)",
                         (sid, cn.strip(), sec.strip(), now()));st.success("Class added.");st.rerun()
             else:
@@ -1839,7 +2121,7 @@ elif user["role"] in ("principal", "teacher", "management"):
             if not sn.strip() or mx <= 0 or pm < 0 or pm > mx:
                 st.error(
                     "Enter valid subject name, total marks and passing marks. Passing marks cannot exceed total marks.")
-            elif one("SELECT id FROM subjects WHERE school_id=? AND LOWER(subject_name)=LOWER(?)", (sid, sn.strip())):
+            elif one("SELECT id FROM subjects WHERE school_id=? AND LOWER(subject_name)=LOWER(?)", (sid, sn.strip()), fresh=True):
                 st.error("Subject already exists.")
             else:
                 execute(
@@ -1885,9 +2167,9 @@ elif user["role"] in ("principal", "teacher", "management"):
                 if not name.strip() or not roll.strip():
                     st.error("Name and roll number required.")
                 elif one("SELECT id FROM students WHERE school_id=? AND class_id=? AND roll_number=?",
-                         (sid, cid, roll.strip())):
+                         (sid, cid, roll.strip()), fresh=True):
                     st.error("That roll number already exists in this class/section.")
-                elif su.strip() and (len(sp) < 6 or one("SELECT id FROM users WHERE username=?", (su.strip(),))):
+                elif su.strip() and (len(sp) < 6 or one("SELECT id FROM users WHERE username=?", (su.strip(),), fresh=True)):
                     st.error("Student username must be unique and password must be 6+ characters.")
                 else:
                     execute(
@@ -1895,7 +2177,7 @@ elif user["role"] in ("principal", "teacher", "management"):
                         (sid, cid, name.strip(), roll.strip(), phone.strip(), email.strip(), now()));
                     st.success("Student added.");
                     stu = one("SELECT id FROM students WHERE school_id=? AND class_id=? AND roll_number=?",
-                              (sid, cid, roll.strip()))
+                              (sid, cid, roll.strip()), fresh=True)
                     if su.strip(): execute(
                         "INSERT INTO users(username,password,name,role,school_id,student_id,active,created_at) VALUES(?,?,?,?,?,?,1,?)",
                         (su.strip(), hash_password(sp), name.strip(), "student", sid, stu[0], now()))
@@ -1948,7 +2230,7 @@ elif user["role"] in ("principal", "teacher", "management"):
                                    VALUES(?,?,?,?,?,?)""",(s[0],sub[0],cid,academic_year,val,now()))
                     # Keep legacy marks current for compatibility with old reports.
                     if academic_year==current_academic_year():
-                        legacy=one("SELECT id FROM marks WHERE student_id=? AND subject_id=?",(s[0],sub[0]))
+                        legacy=one("SELECT id FROM marks WHERE student_id=? AND subject_id=?",(s[0],sub[0]),fresh=True)
                         if legacy: execute("UPDATE marks SET marks=?,updated_at=? WHERE id=?",(val,now(),legacy[0]))
                         else: execute("INSERT OR IGNORE INTO marks(student_id,subject_id,marks,updated_at) VALUES(?,?,?,?)",(s[0],sub[0],val,now()))
                     log(user["id"],"SAVE_RESULT",f"student={s[0]},subject={sub[0]},year={academic_year}")
@@ -2838,24 +3120,17 @@ elif user["role"] in ("principal", "teacher", "management"):
 
     elif choice == "Institution Report":
         st.header("📈 Institution Report")
-        stats=[("Classes",one("SELECT COUNT(*) FROM classes WHERE school_id=?",(sid,))[0]),
-               ("Students",one("SELECT COUNT(*) FROM students WHERE school_id=?",(sid,))[0]),
-               ("Teachers",one("SELECT COUNT(*) FROM users WHERE school_id=? AND role='teacher'",(sid,))[0]),
-               ("Principals",one("SELECT COUNT(*) FROM users WHERE school_id=? AND role='principal'",(sid,))[0]),
-               ("Management",one("SELECT COUNT(*) FROM users WHERE school_id=? AND role='management'",(sid,))[0]),
-               ("Parents",one("SELECT COUNT(*) FROM users WHERE school_id=? AND role='parent'",(sid,))[0])]
+        inst_stats=institution_statistics(sid)
+        stats=[("Classes",inst_stats[5]),
+               ("Students",inst_stats[4]),
+               ("Teachers",inst_stats[0]),
+               ("Principals",inst_stats[1]),
+               ("Management",inst_stats[2]),
+               ("Parents",inst_stats[3])]
         st.dataframe(pd.DataFrame(stats,columns=["Metric","Value"]),use_container_width=True,hide_index=True)
-        perf=[]
-        for cl in execute("SELECT id,class_name,section FROM classes WHERE school_id=?", (sid,), fetch=True) or []:
-            df = detailed_results_csv(sid, cl[0])
-            if not df.empty:
-                # clean Percentage column to numbers, ignore % signs and text
-                df["Percentage"] = pd.to_numeric(df["Percentage"].astype(str).str.replace('%', ''), errors="coerce")
-                avg = df["Percentage"].mean(skipna=True)
-                perf.append({"Class": cl[1], "Section": cl[2], "Students": len(df),
-                             "Average %": round(avg, 2) if pd.notna(avg) else 0.0})
+        perf=class_performance_summary(sid)
         if perf:
-            pdf=pd.DataFrame(perf).sort_values("Average %",ascending=False)
+            pdf=pd.DataFrame(perf,columns=["Class","Section","Students","Average %"]).sort_values("Average %",ascending=False)
             st.dataframe(pdf,use_container_width=True,hide_index=True)
             st.success(f"Best-performing class: {pdf.iloc[0]['Class']} - {pdf.iloc[0]['Section']} ({pdf.iloc[0]['Average %']}%)")
         else: st.info("No results available yet.")
@@ -2875,7 +3150,7 @@ elif user["role"] in ("principal", "teacher", "management"):
             nu=st.text_input("New Username",value=user["username"])
             if st.button("Change Username"):
                 if not nu.strip(): st.error("Username cannot be empty.")
-                elif nu.strip()!=user["username"] and one("SELECT id FROM users WHERE username=?",(nu.strip(),)):
+                elif nu.strip()!=user["username"] and one("SELECT id FROM users WHERE username=?",(nu.strip(),),fresh=True):
                     st.error("Username already exists.")
                 elif nu.strip()==user["username"]: st.info("This is already your username.")
                 else:
@@ -2887,7 +3162,7 @@ elif user["role"] in ("principal", "teacher", "management"):
             new=st.text_input("New Password",type="password")
             con=st.text_input("Confirm New Password",type="password")
             if st.button("Change Password"):
-                stored=one("SELECT password FROM users WHERE id=?",(user["id"],))
+                stored=one("SELECT password FROM users WHERE id=?",(user["id"],),fresh=True)
                 if not stored or not verify_password(old,stored[0]): st.error("Current password is incorrect.")
                 elif len(new)<6 or new!=con: st.error("Password must match and contain 6+ characters.")
                 else:
@@ -2907,7 +3182,7 @@ elif user["role"] in ("principal", "teacher", "management"):
             if st.button("Create Management Account",key="create_management_account"):
                 if not mn.strip() or not mu.strip() or len(mp)<6:
                     st.error("Enter name, username and password (6+ characters).")
-                elif one("SELECT id FROM users WHERE username=?",(mu.strip(),)):
+                elif one("SELECT id FROM users WHERE username=?",(mu.strip(),),fresh=True):
                     st.error("Username already exists.")
                 else:
                     execute("""INSERT INTO users(username,password,name,role,school_id,active,can_view_dashboard,created_at)
@@ -2989,13 +3264,13 @@ elif user["role"] in ("principal", "teacher", "management"):
             if st.button("Create Parent Account",key="principal_create_parent"):
                 if not p_name.strip() or not p_user.strip() or len(p_pw)<6:
                     st.error("Enter parent name, unique username and password of at least 6 characters.")
-                elif one("SELECT id FROM users WHERE username=?",(p_user.strip(),)):
+                elif one("SELECT id FROM users WHERE username=?",(p_user.strip(),),fresh=True):
                     st.error("Username already exists.")
                 else:
                     ok,msg=create_user(p_user.strip(),p_pw,p_name.strip(),"parent",
                                        school_id=sid,student_id=p_student)
                     if ok:
-                        pu=one("SELECT id FROM users WHERE username=?",(p_user.strip(),))
+                        pu=one("SELECT id FROM users WHERE username=?",(p_user.strip(),),fresh=True)
                         if pu:
                             execute("INSERT OR IGNORE INTO parent_student(parent_user_id,student_id) VALUES(?,?)",(pu[0],p_student))
                         log(user["id"],"CREATE_PARENT",p_user.strip())
@@ -3128,7 +3403,7 @@ elif user["role"] in ("student", "parent"):
                     nu=st.text_input("New Username",value=user["username"])
                     if st.button("Change Username"):
                         if not nu.strip(): st.error("Username cannot be empty.")
-                        elif nu.strip()!=user["username"] and one("SELECT id FROM users WHERE username=?",(nu.strip(),)):
+                        elif nu.strip()!=user["username"] and one("SELECT id FROM users WHERE username=?",(nu.strip(),),fresh=True):
                             st.error("Username already exists.")
                         elif nu.strip()==user["username"]: st.info("This is already your username.")
                         else:
@@ -3139,7 +3414,7 @@ elif user["role"] in ("student", "parent"):
                     new=st.text_input("New Password",type="password")
                     con=st.text_input("Confirm New Password",type="password")
                     if st.button("Change Password"):
-                        stored=one("SELECT password FROM users WHERE id=?",(user["id"],))
+                        stored=one("SELECT password FROM users WHERE id=?",(user["id"],),fresh=True)
                         if not stored or not verify_password(old,stored[0]): st.error("Current password is incorrect.")
                         elif len(new)<6 or new!=con: st.error("Password must match and contain 6+ characters.")
                         else:
