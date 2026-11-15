@@ -2,3 +2,4 @@ streamlit
 pandas
 libsql
 python-dotenv
+reportlab
